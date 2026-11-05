@@ -22,20 +22,27 @@
             }
         };
 
+
         window.addEventListener('message', (event) => {
-            if (event.data.action === 'loadExcel') {
-                if (window.luckysheet) {
-                    try { window.luckysheet.destroy(); } catch(e) {}
-                    window.luckysheet.create({
-                        container: 'luckysheet',
-                        data: event.data.sheets,
-                        title: event.data.title,
-                        userInfo: event.data.userInfo,
-                        showinfobar: false,
-                        lang: 'en'
-                    });
-                }
+            if (event.source !== window.parent || event.origin !== window.location.origin || !event.data) return;
+            if (event.data.action === 'pingExcel') {
+                window.parent.postMessage({ action: 'iframeReady' }, window.location.origin);
+                return;
+            }
+            if (event.data.action !== 'loadExcel') return;
+            const requestId = event.data.requestId;
+            const reply = message => window.parent.postMessage({ ...message, requestId }, window.location.origin);
+            try {
+                if (!window.luckysheet) throw new Error('Не удалось загрузить табличный просмотрщик.');
+                try { window.luckysheet.destroy(); } catch (_) {}
+                window.luckysheet.create({
+                    container: 'luckysheet', data: event.data.sheets,
+                    title: event.data.title, showinfobar: false, lang: 'en',
+                    hook: { workbookCreateAfter: () => reply({ action: 'excelLoaded' }) }
+                });
+            } catch (error) {
+                console.error('Excel create failed', error.stack || error);
+                reply({ action: 'excelError', error: error.message || String(error) });
             }
         });
-        
-        window.parent.postMessage({ action: 'iframeReady' }, '*');
+        window.parent.postMessage({ action: 'iframeReady' }, window.location.origin);

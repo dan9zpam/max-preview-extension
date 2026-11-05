@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MAX File Previewer",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Предпросмотр Office-документов, архивов, кода (с запуском!) и медиа в мессенджере MAX.",
   "permissions": [
     "tabs",

@@ -5,6 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '..');
+const XLSX = require('../viewer/libs/xlsx.full.min.js');
 const zipContext = { setTimeout, clearTimeout, setImmediate, Uint8Array, ArrayBuffer, Promise, TextEncoder, TextDecoder };
 vm.createContext(zipContext);
 vm.runInContext(fs.readFileSync(path.join(root, 'viewer/libs/jszip.min.js'), 'utf8'), zipContext);
@@ -34,6 +35,17 @@ async function makeDocx() {
     zip.file('padding.txt', 'x'.repeat(600000));
     return Buffer.from(await zip.generateAsync({ type: 'uint8array' }));
 }
+function makeExcel(bookType) {
+    const book = XLSX.utils.book_new();
+    const sheet = XLSX.utils.aoa_to_sheet([['Проверка Excel', null, 'Дата'], ['Значение', 42, 46000], ['Итого', 100]]);
+    sheet['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 1 } }];
+    sheet.B3 = { t: 'n', v: 84, f: 'B2*2' };
+    sheet.C2.z = 'dd.mm.yyyy';
+    XLSX.utils.book_append_sheet(book, sheet, 'Данные');
+    XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet([['Второй лист', 7]]), 'Итоги');
+    XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet([]), 'Пустой');
+    return Buffer.from(XLSX.write(book, { type: 'buffer', bookType }));
+}
 (async () => {
     const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'max-preview-test-'));
     const context = await chromium.launchPersistentContext(profile, {
@@ -47,10 +59,14 @@ async function makeDocx() {
         const pdf = makePdf();
         const docx = await makeDocx();
         const archive = new zipContext.JSZip();
+        const xlsx = makeExcel('xlsx');
+        const xls = makeExcel('xls');
         archive.file('inner.pdf', new Uint8Array(pdf));
+        archive.file('inner.xlsx', new Uint8Array(xlsx));
         const archiveBytes = Buffer.from(await archive.generateAsync({ type: 'uint8array' }));
         await context.route('https://web.max.ru/**', route => route.fulfill({ contentType: 'text/html', body: '<a id="file" href="https://web.max.ru/report.pdf#page=1">Документ\n42 КБ</a>' }));
         const files = new Map([
+            ['/xlsx', { body: xlsx }], ['/xls', { body: xls }],
             ['/multipage', { body: makePdf(3) }], ['/archive', { body: archiveBytes }], ['/pdf', { body: pdf }], ['/docx', { body: docx }],
             ['/named', { body: docx, headers: { 'content-disposition': "attachment; filename*=UTF-8''%D0%A2%D0%B5%D1%81%D1%82.docx" } }],
             ['/broken', { body: Buffer.from('broken data') }],
@@ -69,6 +85,42 @@ async function makeDocx() {
         async function open(endpoint, name) {
             await page.goto(`chrome-extension://${id}/viewer/viewer.html?url=${encodeURIComponent('https://files.max.ru/' + endpoint)}&name=${encodeURIComponent(name)}`);
         }
+        async function expectExcel(targetPage = page) {
+            try { await targetPage.waitForFunction(() => document.querySelector('#loading').style.display === 'none'); }
+            catch (error) { console.log('LOADING', await targetPage.locator('#loading').textContent(), errors); throw error; }
+            const frame = targetPage.frameLocator('#luckysheet-iframe');
+            await frame.locator('#luckysheet-cell-main').waitFor();
+            const result = await targetPage.frames().find(f => f.url().includes('luckysheet_iframe')).evaluate(() => {
+                const sheets = luckysheet.getAllSheets();
+                return { names: sheets.map(s => s.name), value: sheets[0].data[1][1].v,
+                    formulaResult: sheets[0].data[2][1].v, merge: sheets[0].config.merge['0_0'],
+                    date: sheets[0].data[1][2].m };
+            });
+            assert.deepEqual(result.names, ['Данные', 'Итоги', 'Пустой']);
+            assert.equal(result.value, 42);
+            assert.equal(result.formulaResult, 84);
+            assert.equal(result.merge.cs, 2);
+            assert.match(result.date, /\d{2}\.\d{2}\.\d{4}/);
+            return frame;
+        }
+        await open('xlsx', 'Таблица.xlsx');
+        let frame = await expectExcel();
+        await frame.locator('.luckysheet-sheets-item').filter({ hasText: 'Итоги' }).click();
+        await page.waitForFunction(() => document.querySelector('#luckysheet-iframe').contentWindow.luckysheet.getSheet().name === 'Итоги');
+        console.log('PASS XLSX data, sheets, empty sheet, merged cells, dates and cached formulas');
+        await open('xls', 'Таблица.xls');
+        await expectExcel();
+        console.log('PASS legacy XLS');
+        await open('xlsx', 'Документ');
+        await expectExcel();
+        assert.equal(await page.locator('#fileName').textContent(), 'Документ.xlsx');
+        await page.evaluate(() => { LuckyExcel.transformExcelToLucky = (_file, _ok, fail) => fail(new Error('Unsupported workbook')); });
+        await page.evaluate(() => loadFile());
+        await expectExcel();
+        await page.evaluate(() => { LuckyExcel.transformExcelToLucky = () => {}; });
+        await page.evaluate(() => loadFile());
+        await expectExcel();
+        console.log('PASS opaque Excel URL, converter errors and nonresponding converter fallback');
         await open('pdf', 'Отчёт');
         await page.waitForSelector('.pdf-page');
         await page.waitForFunction(() => document.querySelector('#loading').style.display === 'none');
@@ -85,13 +137,16 @@ async function makeDocx() {
             assert.equal(await page.locator('#fileName').textContent(), expected);
         }
         console.log('PASS real DOCX renderer, opaque URLs, UTF-8 Content-Disposition');
-        for (const [endpoint, name, message] of [['broken', 'test.pdf', 'Ошибка:'], ['broken', 'test.docx', 'Ошибка:'], ['login', 'test.docx', 'Вместо документа'], ['empty', 'test.pdf', 'пустой файл'], ['denied', 'test.docx', 'HTTP 403']]) {
+        for (const [endpoint, name, message] of [['broken', 'test.xlsx', 'Файл не является книгой Excel'], ['broken', 'test.xls', 'Файл не является книгой Excel'], ['broken', 'test.pdf', 'Ошибка:'], ['broken', 'test.docx', 'Ошибка:'], ['login', 'test.docx', 'Вместо документа'], ['empty', 'test.pdf', 'пустой файл'], ['denied', 'test.docx', 'HTTP 403']]) {
             await open(endpoint, name);
             await page.waitForFunction(text => document.querySelector('#loading').textContent.includes(text), message);
         }
         console.log('PASS corrupt PDF/DOCX, HTML login response, empty file, HTTP 403');
         await open('archive', 'archive.zip');
-        await page.locator('#zip-list button').click();
+        await page.locator('#zip-list li').filter({ hasText: 'inner.xlsx' }).locator('button').click();
+        await expectExcel();
+        await open('archive', 'archive.zip');
+        await page.locator('#zip-list li').filter({ hasText: 'inner.pdf' }).locator('button').click();
         await page.waitForSelector('.pdf-page');
         assert.equal(await page.locator('.pdf-page').count(), 1);
         assert.equal(await page.locator('#downloadOriginalBtn').isVisible(), true);
@@ -115,6 +170,15 @@ async function makeDocx() {
         const blobPopup = await blobPopupPromise;
         await blobPopup.waitForFunction(() => document.querySelector('#docx-container').textContent.includes('Проверка DOCX'));
         assert.equal(new URL(blobPopup.url()).searchParams.get('url'), blobUrl);
+        await source.evaluate(bytes => {
+            const a = document.querySelector('#file');
+            a.href = URL.createObjectURL(new Blob([new Uint8Array(bytes)]));
+            a.innerText = 'Таблица.xlsx\n20 КБ';
+        }, [...xlsx]);
+        const excelPopupPromise = context.waitForEvent('page');
+        await source.locator('#file').click();
+        await expectExcel(await excelPopupPromise);
+        console.log('PASS page-owned XLSX blob');
         console.log('PASS content-script filename detection and page-owned blob transfer across multiple chunks');
         assert.deepEqual(errors, []);
     } finally {

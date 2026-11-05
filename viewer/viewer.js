@@ -118,58 +118,7 @@ async function renderBlob(blob, fileName, isInnerFile = false) {
             container.style.display = 'block';
             await docx.renderAsync(await blob.arrayBuffer(), container);
         } else if (ext === 'xlsx' || ext === 'xls') {
-            const iframe = document.getElementById('luckysheet-iframe');
-            iframe.style.display = 'block';
-            
-            const file = new File([blob], fileName, {type: blob.type});
-            LuckyExcel.transformExcelToLucky(file, function(exportJson, luckysheetfile){
-                if(exportJson.sheets == null || exportJson.sheets.length == 0){
-                    throw new Error("Ошибка чтения excel файла (пустые данные)!");
-                }
-                
-                let hasActive = false;
-                exportJson.sheets.forEach(sheet => {
-                    if (sheet.status == 1) {
-                        if (hasActive) {
-                            sheet.status = 0;
-                        } else {
-                            hasActive = true;
-                        }
-                    }
-                });
-                if (!hasActive && exportJson.sheets.length > 0) {
-                    exportJson.sheets[0].status = 1;
-                }
-
-                let isSent = false;
-                const sendData = () => {
-                    if (isSent) return;
-                    isSent = true;
-                    loadingEl.style.display = 'none';
-                    iframe.contentWindow.postMessage({
-                        action: 'loadExcel',
-                        sheets: exportJson.sheets,
-                        title: (exportJson.info && exportJson.info.name) ? exportJson.info.name : fileName,
-                        userInfo: (exportJson.info && exportJson.info.creator) ? exportJson.info.creator : ''
-                    }, '*');
-                };
-                
-                window.addEventListener('message', (event) => {
-                    if (event.data && event.data.action === 'iframeReady') {
-                        sendData();
-                    }
-                });
-                
-                setTimeout(() => {
-                    if(!isSent) sendData();
-                }, 1500);
-            }, function(err){
-                console.error("Import failed", err);
-                if(loadingEl) {
-                    loadingEl.style.display = 'block';
-                    loadingEl.innerHTML = '<span style="color:red; font-weight:bold;">Ошибка чтения Excel:</span><br>' + err;
-                }
-            });
+            await renderExcel(blob, fileName);
         } else if (ext === 'pptx') {
             loadingEl.style.display = 'none';
             const container = document.getElementById('pptx-container');
@@ -606,7 +555,9 @@ async function loadFile() {
         } else if (isZip) {
             const zip = await JSZip.loadAsync(await blob.arrayBuffer());
             if (zip.file('word/document.xml') && !/\.docx$/i.test(originalFileName)) originalFileName += '.docx';
+            else if (zip.file('xl/workbook.xml') && !/\.xlsx$/i.test(originalFileName)) originalFileName += '.xlsx';
         }
+        if (signature[0] === 0xd0 && signature[1] === 0xcf && !/\.[a-z0-9]+$/i.test(originalFileName)) originalFileName += '.xls';
         await renderBlob(blob, originalFileName);
     } catch (error) {
         console.error(error);

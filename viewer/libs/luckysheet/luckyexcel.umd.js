@@ -22855,9 +22855,10 @@ var LuckyExcel =
 function () {
   function LuckyExcel() {}
 
-  LuckyExcel.transformExcelToLucky = function (excelFile, callBack) {
+  LuckyExcel.transformExcelToLucky = function (excelFile, callBack, onError) {
     var handleZip = new HandleZip_1.HandleZip(excelFile);
     handleZip.unzipFile(function (files) {
+      try {
       var luckyFile = new LuckyFile_1.LuckyFile(files, excelFile.name);
       var luckysheetfile = luckyFile.Parse();
       var exportJson = JSON.parse(luckysheetfile);
@@ -22865,8 +22866,13 @@ function () {
       if (callBack != undefined) {
         callBack(exportJson, luckysheetfile);
       }
+      } catch (err) {
+        if (onError) onError(err);
+        else console.error(err);
+      }
     }, function (err) {
-      console.error(err);
+      if (onError) onError(err);
+      else console.error(err);
     });
   };
 
