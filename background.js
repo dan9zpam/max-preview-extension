@@ -37,7 +37,7 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
 
             if (filename.match(/\.(pdf|docx|xlsx|xls|png|jpeg|jpg|rtf|zip|pptx|odt|txt|csv|py|c|cpp|java|cs|go|php|rb|swift|ts|sh|json|xml|md|js|css|html|mp3|wav|ogg|mp4|webm|avi|mov|mkv)$/i)) {
                 chrome.downloads.cancel(downloadItem.id, () => {
-                    const viewerUrl = chrome.runtime.getURL(`viewer/viewer.html?url=${encodeURIComponent(downloadItem.url)}&name=${encodeURIComponent(downloadItem.filename)}`);
+                    const viewerUrl = chrome.runtime.getURL(`viewer/viewer.html?url=${encodeURIComponent(downloadItem.finalUrl || downloadItem.url)}&name=${encodeURIComponent(downloadItem.filename)}&sourceTab=${tabs[0] ? tabs[0].id : ''}`);
                     chrome.tabs.create({ url: viewerUrl });
                     suggest(); // REQUIRED BY CHROME API
                 });
@@ -52,7 +52,8 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === 'openViewer') {
-        const viewerUrl = chrome.runtime.getURL(`viewer/viewer.html?url=${encodeURIComponent(message.fileUrl)}&name=${encodeURIComponent(message.fileName)}`);
+        if (!sender.tab || !sender.url || new URL(sender.url).hostname !== 'web.max.ru') return;
+        const viewerUrl = chrome.runtime.getURL(`viewer/viewer.html?url=${encodeURIComponent(message.fileUrl)}&name=${encodeURIComponent(message.fileName)}&sourceTab=${sender.tab.id}`);
         chrome.tabs.create({ url: viewerUrl });
     }
 });

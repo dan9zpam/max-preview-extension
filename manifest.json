@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MAX File Previewer",
-  "version": "1.0",
+  "version": "1.0.1",
   "description": "Предпросмотр Office-документов, архивов, кода (с запуском!) и медиа в мессенджере MAX.",
   "permissions": [
     "tabs",
@@ -9,7 +9,7 @@
     "storage"
   ],
   "host_permissions": [
-    "*://web.max.ru/*"
+    "*://*.max.ru/*"
   ],
   "content_scripts": [
     {
@@ -60,5 +60,8 @@
     "pages": [
       "viewer/runner.html"
     ]
-  }
+  },
+  "optional_host_permissions": [
+    "https://*/*"
+  ]
 }

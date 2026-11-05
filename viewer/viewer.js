@@ -1,13 +1,14 @@
 
 const urlParams = new URLSearchParams(window.location.search);
 const fileUrl = urlParams.get('url');
-let originalFileName = urlParams.get('name') || 'Document';
+let originalFileName = (urlParams.get('name') || 'Document').split(/[\\/]/).pop() || 'Document';
+const sourceTab = Number(urlParams.get('sourceTab'));
 
 window.onerror = function(msg, url, lineNo, columnNo, error) {
     const loadingEl = document.getElementById('loading');
     if(loadingEl) {
         loadingEl.style.display = 'block';
-        loadingEl.innerHTML = `<span style="color:red; font-weight:bold;">Global Error:</span><br>${msg}<br>Line: ${lineNo}`;
+        loadingEl.textContent = `Ошибка: ${msg} (строка ${lineNo})`;
     }
     return false;
 };
@@ -109,11 +110,13 @@ async function renderBlob(blob, fileName, isInnerFile = false) {
             const container = document.getElementById('img-container');
             document.getElementById('img-preview').src = URL.createObjectURL(blob);
             container.style.display = 'block';
+        } else if (ext === 'pdf') {
+            await renderPdf(blob);
         } else if (ext === 'docx') {
             loadingEl.style.display = 'none';
             const container = document.getElementById('docx-container');
             container.style.display = 'block';
-            await docx.renderAsync(blob, container);
+            await docx.renderAsync(await blob.arrayBuffer(), container);
         } else if (ext === 'xlsx' || ext === 'xls') {
             const iframe = document.getElementById('luckysheet-iframe');
             iframe.style.display = 'block';
@@ -530,113 +533,138 @@ async function renderBlob(blob, fileName, isInnerFile = false) {
     } catch (e) {
         console.error(e);
         loadingEl.style.display = 'block';
-        loadingEl.innerHTML = `<span style="color:red; font-weight:bold;">Ошибка:</span><br>${e.message}`;
+        showError(e);
+    }
+}
+
+function showError(error) {
+    const loadingEl = document.getElementById('loading');
+    loadingEl.style.display = 'block';
+    loadingEl.textContent = 'Ошибка: ' + error.message;
+}
+
+async function readSourceBlob() {
+    if (!urlParams.has('sourceTab') || !Number.isInteger(sourceTab)) {
+        throw new Error('Откройте файл заново из вкладки MAX.');
+    }
+    const chunks = [];
+    let offset = 0;
+    let result;
+    try {
+        do {
+            result = await chrome.tabs.sendMessage(sourceTab, {
+                action: 'readPreviewBlob', url: fileUrl, offset
+            });
+            if (!result || result.error) throw new Error(result?.error || 'Вкладка MAX недоступна');
+            const bytes = Uint8Array.from(atob(result.data), char => char.charCodeAt(0));
+            if (!bytes.length && offset < result.size) throw new Error('Неполные данные файла');
+            chunks.push(bytes);
+            offset += bytes.length;
+        } while (offset < result.size);
+        return new Blob(chunks, { type: result.type });
+    } finally {
+        chrome.tabs.sendMessage(sourceTab, { action: 'releasePreviewBlob', url: fileUrl }).catch(() => {});
     }
 }
 
 async function loadFile() {
-    const loadingEl = document.getElementById('loading');
     try {
-        if (!fileUrl) return; // if opened directly without url
+        if (!fileUrl) throw new Error('Не указан адрес файла. Откройте документ из MAX.');
+        document.getElementById('loading').textContent = 'Загрузка файла...';
+        let blob;
+        let contentDisposition = '';
         if (fileUrl.startsWith('blob:')) {
-            throw new Error("Файл зашифрован (blob).");
+            blob = await readSourceBlob();
+        } else {
+            const response = await fetch(fileUrl, { credentials: 'include' });
+            if (!response.ok) throw new Error('HTTP ' + response.status + '. Откройте файл заново из MAX.');
+            contentDisposition = response.headers.get('content-disposition') || '';
+            blob = await response.blob();
         }
-        
-        loadingEl.innerHTML = `Загрузка файла...`;
-        
-        const extMatch = originalFileName.match(/\.([a-zA-Z0-9]+)$/);
-        let ext = extMatch ? extMatch[1].toLowerCase() : '';
-        if (!ext) {
-            const urlExtMatch = fileUrl.split('?')[0].match(/\.([a-zA-Z0-9]+)$/);
-            if (urlExtMatch) ext = urlExtMatch[1].toLowerCase();
+        if (!blob.size) throw new Error('Получен пустой файл.');
+        const type = blob.type.split(';')[0];
+        if (type === 'text/html' && !/\.html$/i.test(originalFileName)) {
+            throw new Error('Вместо документа сервер вернул страницу. Возможно, ссылка устарела или требуется вход в MAX.');
         }
-
-        if (ext === 'pdf') {
-            await renderPdfFromUrl(fileUrl, originalFileName);
-            return;
+        const dispositionName = /filename\*=UTF-8''([^;]+)/i.exec(contentDisposition);
+        const plainName = /filename="([^"]+)"|filename=([^;]+)/i.exec(contentDisposition);
+        let serverName = dispositionName ? dispositionName[1] : plainName ? plainName[1] || plainName[2] : '';
+        try { serverName = decodeURIComponent(serverName); } catch (_) {}
+        if (serverName) originalFileName = serverName.trim().split(/[\\/]/).pop();
+        if (!/\.[a-z0-9]+$/i.test(originalFileName)) {
+            let urlName = '';
+            try { urlName = decodeURIComponent(new URL(fileUrl).pathname.split('/').pop()); } catch (_) {}
+            const extension = /\.([a-z0-9]+)$/i.exec(urlName);
+            if (extension) originalFileName += '.' + extension[1];
         }
-
-        const response = await fetch(fileUrl);
-        if (!response.ok) throw new Error("HTTP " + response.status);
-        
-        // ПРИНУДИТЕЛЬНО задаем правильный MIME-тип
-        let mimeType = 'application/octet-stream';
-        if (ext === 'pdf') mimeType = 'application/pdf';
-        if (ext === 'png') mimeType = 'image/png';
-        if (ext === 'jpeg' || ext === 'jpg') mimeType = 'image/jpeg';
-        if (ext === 'docx') mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-        if (ext === 'xlsx') mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-        if (ext === 'xls') mimeType = 'application/vnd.ms-excel';
-        if (ext === 'rtf') mimeType = 'application/rtf';
-        if (ext === 'zip') mimeType = 'application/zip';
-        if (ext === 'odt') mimeType = 'application/vnd.oasis.opendocument.text';
-        if (ext === 'pptx') mimeType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
-        if (['txt','csv','json','xml','md','js','css','html'].includes(ext)) mimeType = 'text/plain';
-        if (['mp4','webm','ogg'].includes(ext)) mimeType = 'video/' + ext;
-        if (['mp3','wav','ogg'].includes(ext)) mimeType = 'audio/' + (ext==='mp3'?'mpeg':ext);
-        
-        const rawBlob = await response.blob();
-        const blob = new Blob([rawBlob], { type: mimeType });
-        
+        // Detect PDFs and DOCX by content too: opaque attachment URLs and labels
+        // need not contain an extension, and servers often send octet-stream.
+        const signature = new Uint8Array(await blob.slice(0, 1024).arrayBuffer());
+        const isZip = signature[0] === 0x50 && signature[1] === 0x4b;
+        if (!isZip && new TextDecoder().decode(signature).includes('%PDF-')) {
+            if (!/\.pdf$/i.test(originalFileName)) originalFileName += '.pdf';
+        } else if (isZip) {
+            const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+            if (zip.file('word/document.xml') && !/\.docx$/i.test(originalFileName)) originalFileName += '.docx';
+        }
         await renderBlob(blob, originalFileName);
-
-    } catch (e) {
-        console.error(e);
-        loadingEl.style.display = 'block';
-        loadingEl.innerHTML = `<span style="color:red; font-weight:bold;">Ошибка:</span><br>${e.message}`;
+    } catch (error) {
+        console.error(error);
+        showError(error);
+        // CDN hosts vary. Ask only for the actual origin, on a user gesture.
+        if (error instanceof TypeError && /^https:/.test(fileUrl || '') && chrome.permissions) {
+            const button = document.createElement('button');
+            button.textContent = 'Разрешить загрузку с сервера файла и повторить';
+            button.addEventListener('click', async () => {
+                const origin = new URL(fileUrl).origin + '/*';
+                if (await chrome.permissions.request({ origins: [origin] })) {
+                    await loadFile();
+                }
+            });
+            document.getElementById('loading').appendChild(button);
+        }
     }
 }
 
-// Запускаем файл сразу без кнопки
-loadFile();
-
-
-async function renderPdfFromUrl(url, fileName) {
-    const loadingEl = document.getElementById('loading');
-    loadingEl.style.display = 'none';
+async function renderPdf(blob) {
     const container = document.getElementById('pdf-container');
+    const loadingEl = document.getElementById('loading');
+    container.replaceChildren();
     container.style.display = 'block';
-    container.innerHTML = '';
-    
-    hideAllContainers();
-    container.style.display = 'block';
-
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'libs/pdfjs/pdf.worker.min.js';
-    
+    const task = pdfjsLib.getDocument({
+        data: new Uint8Array(await blob.arrayBuffer()),
+        cMapUrl: 'libs/pdfjs/cmaps/',
+        cMapPacked: true,
+        standardFontDataUrl: 'libs/pdfjs/standard_fonts/',
+        isEvalSupported: false
+    });
+    task.onPassword = (updatePassword, reason) => {
+        const password = window.prompt(reason === 2 ? 'Неверный пароль. Введите пароль PDF:' : 'Введите пароль PDF:');
+        if (password === null) {
+            task.destroy();
+            showError(new Error('Ввод пароля отменён. Откройте файл заново для повторной попытки.'));
+        } else updatePassword(password);
+    };
+    const pdf = await task.promise;
+    loadingEl.style.display = 'none';
     try {
-        const loadingTask = pdfjsLib.getDocument(url);
-        const pdfDoc = await loadingTask.promise;
-        
-        for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+        for (let number = 1; number <= pdf.numPages; number++) {
+            const page = await pdf.getPage(number);
+            const base = page.getViewport({ scale: 1 });
+            const scale = Math.min(1.5, Math.max(1, container.clientWidth - 40) / base.width);
+            const viewport = page.getViewport({ scale });
             const canvas = document.createElement('canvas');
             canvas.className = 'pdf-page';
+            canvas.width = Math.ceil(viewport.width);
+            canvas.height = Math.ceil(viewport.height);
             container.appendChild(canvas);
-            
-            const renderPage = async () => {
-                try {
-                    const page = await pdfDoc.getPage(pageNum);
-                    const defaultViewport = page.getViewport({ scale: 1.0 });
-                    const containerWidth = container.clientWidth - 40;
-                    let scale = containerWidth / defaultViewport.width;
-                    if (scale > 1.5) scale = 1.5;
-                    
-                    const viewport = page.getViewport({ scale: scale });
-                    canvas.height = viewport.height;
-                    canvas.width = viewport.width;
-                    await page.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise;
-                } catch (e) {
-                    console.error("Page render error", e);
-                }
-            };
-            
-            if (pageNum <= 2) {
-                await renderPage();
-            } else {
-                setTimeout(renderPage, (pageNum - 2) * 200);
-            }
+            await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+            page.cleanup();
         }
-    } catch (err) {
-        console.error("PDF load error", err);
-        container.innerHTML = '<div style="color:red; padding:20px;">Ошибка при загрузке PDF. Возможно, файл недоступен или поврежден.</div>';
+    } finally {
+        await pdf.destroy();
     }
 }
+
+loadFile();

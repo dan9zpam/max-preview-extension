@@ -4,16 +4,17 @@ document.addEventListener('click', (e) => {
     
     if (target && target.href) {
         const url = target.href;
-        const urlLower = url.toLowerCase();
-        
-        // Проверяем, заканчивается ли ссылка на один из поддерживаемых форматов (игнорируя параметры ?...)
-        if (urlLower.match(/\.(pdf|docx|xlsx|xls|png|jpeg|jpg|rtf|zip|odt|pptx|txt|csv|json|xml|md|js|css|html|py|c|cpp|java|cs|go|php|rb|swift|ts|sh)(\?.*)?$/)) {
+        let urlName;
+        try { urlName = decodeURIComponent(new URL(url).pathname.split('/').pop()); }
+        catch (_) { urlName = ''; }
+        const supported = /\.(pdf|docx|xlsx|xls|png|jpeg|jpg|rtf|zip|odt|pptx|txt|csv|json|xml|md|js|css|html|py|c|cpp|java|cs|go|php|rb|swift|ts|sh)$/i;
+        const label = (target.getAttribute('download') || target.innerText || '').trim();
+        const labelName = label.split(/\r?\n/).map(line => line.trim()).find(line => supported.test(line));
+        const fileName = labelName || urlName;
+        if (supported.test(fileName)) {
             e.preventDefault();
-            e.stopPropagation();
-            
-            // Пытаемся достать имя файла из текста ссылки или из самого URL
-            const fileName = target.innerText.trim() || url.split('/').pop().split('?')[0];
-            
+            e.stopImmediatePropagation();
+
             // Отправляем сообщение в background script для открытия вкладки
             chrome.runtime.sendMessage({
                 action: 'openViewer',
@@ -153,4 +154,34 @@ window.addEventListener('load', () => {
             clearInterval(interval);
         }
     }, 500);
+});
+
+// Blob URLs belong to the MAX tab. Read them there, in bounded chunks,
+// rather than trying to fetch a page-owned URL from the extension origin.
+const previewBlobs = new Map();
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+    if (sender.id !== chrome.runtime.id) return;
+    if (message.action === 'readPreviewBlob') {
+        (async () => {
+            const url = new URL(message.url);
+            if (url.protocol !== 'blob:' || url.origin !== location.origin) {
+                throw new Error('Недопустимый адрес файла');
+            }
+            let blob = previewBlobs.get(message.url);
+            if (!blob) {
+                const response = await fetch(message.url);
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                blob = await response.blob();
+                previewBlobs.set(message.url, blob);
+                setTimeout(() => previewBlobs.delete(message.url), 60000);
+            }
+            const offset = Math.max(0, Number(message.offset) || 0);
+            const bytes = new Uint8Array(await blob.slice(offset, offset + 262144).arrayBuffer());
+            let binary = '';
+            for (const byte of bytes) binary += String.fromCharCode(byte);
+            respond({ data: btoa(binary), size: blob.size, type: blob.type });
+        })().catch(error => respond({ error: error.message }));
+        return true;
+    }
+    if (message.action === 'releasePreviewBlob') previewBlobs.delete(message.url);
 });
