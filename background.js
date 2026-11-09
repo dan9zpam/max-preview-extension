@@ -1,8 +1,15 @@
 
 chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
     if (downloadItem.byExtensionId === chrome.runtime.id) {
-        suggest();
-        return;
+        const key = 'max_download_name:' + downloadItem.url;
+        chrome.storage.session.get(key, result => {
+            const entry = result[key];
+            if (entry && Date.now() - entry.created < 60000) {
+                suggest({ filename: entry.filename, conflictAction: 'uniquify' });
+            } else suggest();
+            chrome.storage.session.remove(key);
+        });
+        return true;
     }
 
     const filename = downloadItem.filename.toLowerCase();

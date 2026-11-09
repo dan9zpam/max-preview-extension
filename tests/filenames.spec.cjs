@@ -1,0 +1,18 @@
+const assert = require('node:assert/strict');
+const { disposition, resolve, decode, clean } = require('../viewer/filenames.js');
+const name = 'Практическая работа № 1.docx';
+assert.equal(disposition(`attachment; filename=backup.docx; filename*=UTF-8'ru'${encodeURIComponent(name)}`), name);
+assert.equal(disposition('attachment; filename="'+ Buffer.from(name).toString('latin1') + '"'), name);
+assert.equal(disposition('attachment; filename="Отчёт; ноябрь.pdf"'), 'Отчёт; ноябрь.pdf');
+assert.equal(disposition("attachment; filename=fallback.pdf; filename*=UTF-8''%ZZ"), 'fallback.pdf');
+assert.equal(decode('Отчёт.docx'), 'Отчёт.docx');
+assert.equal(decode('Résumé.pdf'), 'Résumé.pdf');
+assert.equal(resolve({ provided: name, header: 'attachment; filename="d56da17b4b2447cb9e0cbf38e51a156a"', detected: 'docx' }), name);
+assert.equal(resolve({ provided: 'План', header: 'attachment; filename="6a56a24e.pdf"', detected: 'pdf' }), 'План.pdf');
+assert.equal(resolve({ provided: 'Архив', mime: 'application/zip' }), 'Архив.zip');
+assert.equal(resolve({ provided: 'Document', header: "attachment; filename*=UTF-8''%D0%A2%D0%B5%D1%81%D1%82", detected: 'xlsx' }), 'Тест.xlsx');
+assert.equal(resolve({ provided: 'Отчёт.docx', detected: 'pdf' }), 'Отчёт.pdf');
+assert.equal(resolve({ url: 'https://files.max.ru/download?filename=%D0%9F%D0%BB%D0%B0%D0%BD.pdf' }), 'План.pdf');
+assert.equal(clean('C:\\Users\\user\\Отчёт.docx'), 'Отчёт.docx');
+assert.equal(clean('../../Отчёт.docx'), 'Отчёт.docx');
+console.log('PASS download filenames: Cyrillic, HTTP encodings, opaque IDs, extensions and safe basenames');

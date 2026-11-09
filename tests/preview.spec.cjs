@@ -48,8 +48,12 @@ function makeExcel(bookType) {
 }
 (async () => {
     const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'max-preview-test-'));
+    const downloadDir = path.join(profile, 'downloads');
+    fs.mkdirSync(downloadDir);
+    fs.mkdirSync(path.join(profile, 'Default'));
+    fs.writeFileSync(path.join(profile, 'Default/Preferences'), JSON.stringify({ download: { default_directory: downloadDir, prompt_for_download: false } }));
     const context = await chromium.launchPersistentContext(profile, {
-        headless: true, channel: 'chromium',
+        headless: true, channel: 'chromium', downloadsPath: path.join(profile, 'downloads'),
         args: [`--disable-extensions-except=${root}`, `--load-extension=${root}`]
     });
     try {
@@ -66,6 +70,9 @@ function makeExcel(bookType) {
         const archiveBytes = Buffer.from(await archive.generateAsync({ type: 'uint8array' }));
         await context.route('https://web.max.ru/**', route => route.fulfill({ contentType: 'text/html', body: '<a id="file" href="https://web.max.ru/report.pdf#page=1">Документ\n42 КБ</a>' }));
         const files = new Map([
+            ['/opaque-name', { body: pdf, headers: { 'content-disposition': 'attachment; filename=2dfc5491c802494793456b359d897986' } }],
+            ['/mojibake-name', { body: docx, headers: { 'content-disposition': 'attachment; filename="' + Buffer.from('Практическая работа.docx').toString('latin1') + '"' } }],
+            ['/utf8-name', { body: pdf, headers: { 'content-disposition': "attachment; filename*=UTF-8'ru'%D0%9F%D0%BB%D0%B0%D0%BD" } }],
             ['/xlsx', { body: xlsx }], ['/xls', { body: xls }],
             ['/multipage', { body: makePdf(3) }], ['/archive', { body: archiveBytes }], ['/pdf', { body: pdf }], ['/docx', { body: docx }],
             ['/named', { body: docx, headers: { 'content-disposition': "attachment; filename*=UTF-8''%D0%A2%D0%B5%D1%81%D1%82.docx" } }],
@@ -80,10 +87,30 @@ function makeExcel(bookType) {
             await route.fulfill({ contentType: 'application/octet-stream', ...files.get(new URL(route.request().url()).pathname) });
         });
         const page = await context.newPage();
+        // Playwright's allowAndName mode skips extension filename determination.
+        // Exercise Chrome's native download path and inspect its final filenames.
+        await (await context.newCDPSession(page)).send('Browser.setDownloadBehavior', { behavior: 'default' });
         const errors = [];
         page.on('pageerror', e => errors.push(e.message));
         async function open(endpoint, name) {
             await page.goto(`chrome-extension://${id}/viewer/viewer.html?url=${encodeURIComponent('https://files.max.ru/' + endpoint)}&name=${encodeURIComponent(name)}`);
+        }
+        async function saveAndVerify(targetPage, button, expectedName, bytes) {
+            const before = await targetPage.evaluate(async () => (await chrome.downloads.search({})).map(item => item.id));
+            await targetPage.locator(button).click();
+            let saved;
+            const deadline = Date.now() + 30000;
+            while (!saved && Date.now() < deadline) {
+                saved = await targetPage.evaluate(async previous => {
+                    const items = await chrome.downloads.search({});
+                    return items.find(item => !previous.includes(item.id) && item.state === 'complete');
+                }, before);
+                if (!saved) await targetPage.waitForTimeout(100);
+            }
+            assert.ok(saved, `Download did not complete: ${expectedName}`);
+            assert.equal(path.basename(saved.filename), expectedName);
+            assert.equal(path.dirname(saved.filename), downloadDir);
+            assert.deepEqual(fs.readFileSync(saved.filename), bytes);
         }
         async function expectExcel(targetPage = page) {
             try { await targetPage.waitForFunction(() => document.querySelector('#loading').style.display === 'none'); }
@@ -105,6 +132,7 @@ function makeExcel(bookType) {
         }
         await open('xlsx', 'Таблица.xlsx');
         let frame = await expectExcel();
+        await saveAndVerify(page, '#downloadBtn', 'Таблица.xlsx', xlsx);
         await frame.locator('.luckysheet-sheets-item').filter({ hasText: 'Итоги' }).click();
         await page.waitForFunction(() => document.querySelector('#luckysheet-iframe').contentWindow.luckysheet.getSheet().name === 'Итоги');
         console.log('PASS XLSX data, sheets, empty sheet, merged cells, dates and cached formulas');
@@ -126,6 +154,7 @@ function makeExcel(bookType) {
         await page.waitForFunction(() => document.querySelector('#loading').style.display === 'none');
         assert.equal(await page.locator('#fileName').textContent(), 'Отчёт.pdf');
         assert.match(cookieHeader, /session=test/);
+        await saveAndVerify(page, '#downloadBtn', 'Отчёт.pdf', pdf);
         console.log('PASS PDF signature detection, real PDF.js worker, session cookies');
         await open('multipage', 'Pages.pdf');
         await page.waitForFunction(() => document.querySelectorAll('.pdf-page').length === 3);
@@ -136,6 +165,18 @@ function makeExcel(bookType) {
             await page.waitForFunction(() => document.querySelector('#docx-container').textContent.includes('Проверка DOCX'));
             assert.equal(await page.locator('#fileName').textContent(), expected);
         }
+        await saveAndVerify(page, '#downloadBtn', 'Тест.docx', docx);
+        for (const [endpoint, provided, expected, bytes] of [
+            ['opaque-name', 'Отчёт для группы', 'Отчёт для группы.pdf', pdf],
+            ['mojibake-name', 'Document', 'Практическая работа.docx', docx],
+            ['utf8-name', 'Document', 'План.pdf', pdf]
+        ]) {
+            await open(endpoint, provided);
+            await page.waitForFunction(() => document.querySelector('#loading').style.display === 'none');
+            assert.equal(await page.locator('#fileName').textContent(), expected);
+            await saveAndVerify(page, '#downloadBtn', expected, bytes);
+        }
+        console.log('PASS native downloads: Cyrillic names, extensions, storage IDs, UTF-8 and misencoded headers');
         console.log('PASS real DOCX renderer, opaque URLs, UTF-8 Content-Disposition');
         for (const [endpoint, name, message] of [['broken', 'test.xlsx', 'Файл не является книгой Excel'], ['broken', 'test.xls', 'Файл не является книгой Excel'], ['broken', 'test.pdf', 'Ошибка:'], ['broken', 'test.docx', 'Ошибка:'], ['login', 'test.docx', 'Вместо документа'], ['empty', 'test.pdf', 'пустой файл'], ['denied', 'test.docx', 'HTTP 403']]) {
             await open(endpoint, name);
@@ -150,6 +191,8 @@ function makeExcel(bookType) {
         await page.waitForSelector('.pdf-page');
         assert.equal(await page.locator('.pdf-page').count(), 1);
         assert.equal(await page.locator('#downloadOriginalBtn').isVisible(), true);
+        await saveAndVerify(page, '#downloadBtn', 'inner.pdf', pdf);
+        await saveAndVerify(page, '#downloadOriginalBtn', 'archive.zip', archiveBytes);
         console.log('PASS inner PDF rendering and archive download control');
         const source = await context.newPage();
         await source.goto('https://web.max.ru/');
@@ -170,6 +213,7 @@ function makeExcel(bookType) {
         const blobPopup = await blobPopupPromise;
         await blobPopup.waitForFunction(() => document.querySelector('#docx-container').textContent.includes('Проверка DOCX'));
         assert.equal(new URL(blobPopup.url()).searchParams.get('url'), blobUrl);
+        await saveAndVerify(blobPopup, '#downloadBtn', 'Файл.docx', docx);
         await source.evaluate(bytes => {
             const a = document.querySelector('#file');
             a.href = URL.createObjectURL(new Blob([new Uint8Array(bytes)]));

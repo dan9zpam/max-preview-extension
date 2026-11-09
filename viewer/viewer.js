@@ -1,7 +1,8 @@
 
 const urlParams = new URLSearchParams(window.location.search);
 const fileUrl = urlParams.get('url');
-let originalFileName = (urlParams.get('name') || 'Document').split(/[\\/]/).pop() || 'Document';
+const suppliedFileName = urlParams.get('name') || '';
+let originalFileName = MAXFileNames.resolve({ provided: suppliedFileName, url: fileUrl });
 const sourceTab = Number(urlParams.get('sourceTab'));
 
 window.onerror = function(msg, url, lineNo, columnNo, error) {
@@ -18,44 +19,38 @@ document.getElementById('fileName').textContent = originalFileName;
 
 let currentBlobUrl = null;
 let currentFileName = originalFileName;
-let isInsideZip = false;
+let originalBlobUrl = null;
 
-document.getElementById('downloadBtn').addEventListener('click', () => {
-    const urlToDownload = currentBlobUrl || fileUrl;
-    if (chrome && chrome.downloads && urlToDownload) {
-        chrome.downloads.download({
-            url: urlToDownload,
-            filename: currentFileName
-        });
+async function downloadFile(url, name) {
+    if (!url) return;
+    const filename = MAXFileNames.clean(name) || 'Document';
+    if (chrome?.downloads) {
+        // onDeterminingFilename must explicitly return this name for blob URLs.
+        const key = 'max_download_name:' + url;
+        await chrome.storage.session.set({ [key]: { filename, created: Date.now() } });
+        try {
+            await chrome.downloads.download({ url, filename, conflictAction: 'uniquify' });
+        } catch (error) {
+            await chrome.storage.session.remove(key);
+            throw error;
+        }
     } else {
         const a = document.createElement('a');
-        a.href = urlToDownload || '#';
-        a.download = currentFileName;
+        a.href = url;
+        a.download = filename;
         document.body.appendChild(a);
         a.click();
-        document.body.removeChild(a);
+        a.remove();
     }
-});
-
-const originalBtn = document.getElementById('downloadOriginalBtn');
-if (originalBtn) {
-    originalBtn.addEventListener('click', () => {
-        if (chrome && chrome.downloads && fileUrl) {
-            chrome.downloads.download({
-                url: fileUrl,
-                filename: originalFileName
-            });
-        } else {
-            const a = document.createElement('a');
-            a.href = fileUrl || '#';
-            a.download = originalFileName;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        }
-    });
 }
 
+document.getElementById('downloadBtn').addEventListener('click', () => {
+    downloadFile(currentBlobUrl || fileUrl, currentFileName).catch(showError);
+});
+
+document.getElementById('downloadOriginalBtn')?.addEventListener('click', () => {
+    downloadFile(originalBlobUrl || fileUrl, originalFileName).catch(showError);
+});
 
 function hideAllContainers() {
     ['loading', 'docx-container', 'luckysheet-iframe', 'pdf-container', 'rtf-container', 'img-container', 'zip-container', 'text-container', 'media-container', 'unsupported-container', 'odt-container', 'pptx-container', 'code-container'].forEach(id => {
@@ -72,12 +67,18 @@ function hideAllContainers() {
 }
 
 async function renderBlob(blob, fileName, isInnerFile = false) {
-    if (currentBlobUrl) {
+    // ZIP extraction and some servers label binary documents as text/plain.
+    // Chrome may otherwise replace the requested extension at download time.
+    blob = new Blob([blob], { type: MAXFileNames.mimeFor(fileName) });
+    if (currentBlobUrl && currentBlobUrl !== originalBlobUrl) {
         URL.revokeObjectURL(currentBlobUrl);
     }
     currentBlobUrl = URL.createObjectURL(blob);
-    currentFileName = fileName;
-    isInsideZip = isInnerFile;
+    currentFileName = MAXFileNames.clean(fileName) || 'Document';
+    if (!isInnerFile) {
+        if (originalBlobUrl) URL.revokeObjectURL(originalBlobUrl);
+        originalBlobUrl = currentBlobUrl;
+    }
     
     const originalBtn = document.getElementById('downloadOriginalBtn');
     if (originalBtn) {
@@ -519,6 +520,7 @@ async function readSourceBlob() {
 async function loadFile() {
     try {
         if (!fileUrl) throw new Error('Не указан адрес файла. Откройте документ из MAX.');
+        document.getElementById('downloadBtn').disabled = true;
         document.getElementById('loading').textContent = 'Загрузка файла...';
         let blob;
         let contentDisposition = '';
@@ -535,29 +537,22 @@ async function loadFile() {
         if (type === 'text/html' && !/\.html$/i.test(originalFileName)) {
             throw new Error('Вместо документа сервер вернул страницу. Возможно, ссылка устарела или требуется вход в MAX.');
         }
-        const dispositionName = /filename\*=UTF-8''([^;]+)/i.exec(contentDisposition);
-        const plainName = /filename="([^"]+)"|filename=([^;]+)/i.exec(contentDisposition);
-        let serverName = dispositionName ? dispositionName[1] : plainName ? plainName[1] || plainName[2] : '';
-        try { serverName = decodeURIComponent(serverName); } catch (_) {}
-        if (serverName) originalFileName = serverName.trim().split(/[\\/]/).pop();
-        if (!/\.[a-z0-9]+$/i.test(originalFileName)) {
-            let urlName = '';
-            try { urlName = decodeURIComponent(new URL(fileUrl).pathname.split('/').pop()); } catch (_) {}
-            const extension = /\.([a-z0-9]+)$/i.exec(urlName);
-            if (extension) originalFileName += '.' + extension[1];
-        }
-        // Detect PDFs and DOCX by content too: opaque attachment URLs and labels
-        // need not contain an extension, and servers often send octet-stream.
+        originalFileName = MAXFileNames.resolve({ provided: suppliedFileName, header: contentDisposition, url: fileUrl, mime: blob.type });
+        currentFileName = originalFileName;
         const signature = new Uint8Array(await blob.slice(0, 1024).arrayBuffer());
         const isZip = signature[0] === 0x50 && signature[1] === 0x4b;
-        if (!isZip && new TextDecoder().decode(signature).includes('%PDF-')) {
-            if (!/\.pdf$/i.test(originalFileName)) originalFileName += '.pdf';
-        } else if (isZip) {
+        let detected = '';
+        if (!isZip && new TextDecoder().decode(signature).includes('%PDF-')) detected = 'pdf';
+        else if (isZip) {
             const zip = await JSZip.loadAsync(await blob.arrayBuffer());
-            if (zip.file('word/document.xml') && !/\.docx$/i.test(originalFileName)) originalFileName += '.docx';
-            else if (zip.file('xl/workbook.xml') && !/\.xlsx$/i.test(originalFileName)) originalFileName += '.xlsx';
-        }
-        if (signature[0] === 0xd0 && signature[1] === 0xcf && !/\.[a-z0-9]+$/i.test(originalFileName)) originalFileName += '.xls';
+            if (zip.file('word/document.xml')) detected = 'docx';
+            else if (zip.file('xl/workbook.xml')) detected = 'xlsx';
+            else if (zip.file('ppt/presentation.xml')) detected = 'pptx';
+            else if (zip.file('mimetype') && (await zip.file('mimetype').async('string')).trim() === 'application/vnd.oasis.opendocument.text') detected = 'odt';
+            else detected = 'zip';
+        } else if (signature[0] === 0xd0 && signature[1] === 0xcf && !MAXFileNames.extension(suppliedFileName)) detected = 'xls';
+        originalFileName = MAXFileNames.resolve({ provided: suppliedFileName, header: contentDisposition, url: fileUrl, mime: blob.type, detected });
+        currentFileName = originalFileName;
         await renderBlob(blob, originalFileName);
     } catch (error) {
         console.error(error);
@@ -574,6 +569,8 @@ async function loadFile() {
             });
             document.getElementById('loading').appendChild(button);
         }
+    } finally {
+        document.getElementById('downloadBtn').disabled = false;
     }
 }
 
